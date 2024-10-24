@@ -12,6 +12,15 @@
 #include "SD.h"
 #include "SPI.h"
 
+// Define paths
+#define SENSOR_DATA_DIR "/Sensor_Data"
+#define LOGS_DIR "/Sensor_Data/logs"
+#define TELEMETRY_DIR "/Sensor_Data/telemetry"
+#define CONFIG_DIR "/Sensor_Data/config"
+#define LOGS_FILE "/Sensor_Data/logs/logs.json"
+#define TELEMETRY_FILE "/Sensor_Data/telemetry/telemetry.json"
+#define CONFIG_FILE "/Sensor_Data/config/config.json"
+
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define INA219_I2C_ADDRESS 0x41
 #define SLEEP_PIN 13
@@ -31,6 +40,217 @@ const int ledPin = 2;
 const float movementThreshold = 0.5;
 float prevX = 0, prevY = 0, prevZ = 0;
 int count1;
+bool isSdCardAvailable = false;
+
+// Buffer to store data when SD card is not available
+String dataBuffer = "";
+
+// Function to initialize the SD card and check directories/files
+void initializeSdCard()
+{
+  if (!SD.begin(5))
+  {
+    Serial.println("SD Card Mount Failed");
+    isSdCardAvailable = false;
+    return;
+  }
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("No SD card attached");
+    isSdCardAvailable = false;
+    return;
+  }
+
+  Serial.println("SD Card initialized.");
+  isSdCardAvailable = true;
+
+  // Check and create directories
+  if (!SD.exists(SENSOR_DATA_DIR))
+  {
+    SD.mkdir(SENSOR_DATA_DIR);
+    Serial.println("Created Sensor_Data directory");
+  }
+
+  if (!SD.exists(LOGS_DIR))
+  {
+    SD.mkdir(LOGS_DIR);
+    Serial.println("Created logs directory");
+  }
+
+  if (!SD.exists(TELEMETRY_DIR))
+  {
+    SD.mkdir(TELEMETRY_DIR);
+    Serial.println("Created telemetry directory");
+  }
+
+  if (!SD.exists(CONFIG_DIR))
+  {
+    SD.mkdir(CONFIG_DIR);
+    Serial.println("Created config directory");
+  }
+
+  // Check and create files
+  if (!SD.exists(LOGS_FILE))
+  {
+    File file = SD.open(LOGS_FILE, FILE_WRITE);
+    if (file)
+    {
+      file.println("[]"); // Initialize as an empty JSON array
+      file.close();
+      Serial.println("Created logs.json file");
+    }
+  }
+
+  if (!SD.exists(TELEMETRY_FILE))
+  {
+    File file = SD.open(TELEMETRY_FILE, FILE_WRITE);
+    if (file)
+    {
+      file.println("[]"); // Initialize as an empty JSON array
+      file.close();
+      Serial.println("Created telemetry.json file");
+    }
+  }
+
+  if (!SD.exists(CONFIG_FILE))
+  {
+    File file = SD.open(CONFIG_FILE, FILE_WRITE);
+    if (file)
+    {
+      file.println("{}"); // Initialize as an empty JSON object
+      file.close();
+      Serial.println("Created config.json file");
+    }
+  }
+}
+
+// Function to append JSON data to a file, ensuring each entry is on a new line
+void appendJsonToFile(fs::FS &fs, const char *path, const String &jsonString)
+{
+  if (!isSdCardAvailable)
+  {
+    Serial.println("SD Card not available. Storing data in buffer.");
+    // Buffer data for future write when SD card becomes available
+    dataBuffer += jsonString + "\n";
+    return;
+  }
+
+  // Check if the JSON string is empty or invalid (like `{}` or `null`)
+  if (jsonString == "{}" || jsonString == "null" || jsonString.length() == 0)
+  {
+    Serial.println("Invalid JSON data. Skipping write operation.");
+    return;
+  }
+
+  File file = fs.open(path, FILE_APPEND);
+  if (!file)
+  {
+    Serial.println("Failed to open file for appending");
+    return;
+  }
+
+  // Write the JSON string followed by a newline to ensure it appears on a new line
+  if (file.println(jsonString))
+  {
+    Serial.println("JSON data appended");
+  }
+  else
+  {
+    Serial.println("Append failed");
+  }
+  file.close();
+}
+
+// Task to check SD card availability continuously
+void checkSdCardAvailabilityTask(void *parameters)
+{
+  while (1)
+  {
+    if (!isSdCardAvailable)
+    {
+      initializeSdCard();
+    }
+    else if (dataBuffer.length() > 0)
+    {
+      // If SD card becomes available, flush buffer to files
+      Serial.println("Flushing buffered data to SD card...");
+      appendJsonToFile(SD, TELEMETRY_FILE, dataBuffer);
+      dataBuffer = ""; // Clear buffer after successful write
+    }
+    vTaskDelay(5000 / portTICK_PERIOD_MS); // Check every 5 seconds
+  }
+}
+
+// Function to write a file (used to create JSON files if they don't exist)
+void writeFile(fs::FS &fs, const char *path, const char *message)
+{
+  if (!isSdCardAvailable)
+    return; // Skip if SD card is not available
+
+  Serial.printf("Writing file: %s\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.print(message))
+  {
+    Serial.println("File written");
+  }
+  else
+  {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+
+// Function to read a file
+void readFile(fs::FS &fs, const char *path)
+{
+  if (!isSdCardAvailable)
+    return; // Skip if SD card is not available
+
+  Serial.printf("Reading file: %s\n", path);
+
+  File file = fs.open(path);
+  if (!file)
+  {
+    Serial.println("Failed to open file for reading");
+    return;
+  }
+
+  Serial.print("Read from file: ");
+  while (file.available())
+  {
+    Serial.write(file.read());
+  }
+  file.close();
+}
+
+// Function to check and create JSON files if they don't exist
+void checkAndCreateFiles()
+{
+  if (!SD.exists(LOGS_FILE))
+  {
+    Serial.println("Logs JSON file does not exist. Creating...");
+    writeFile(SD, LOGS_FILE, "{}");
+  }
+
+  if (!SD.exists(TELEMETRY_FILE))
+  {
+    Serial.println("Telemetry JSON file does not exist. Creating...");
+    writeFile(SD, TELEMETRY_FILE, "{}");
+  }
+
+  if (!SD.exists(CONFIG_FILE))
+  {
+    Serial.println("Config JSON file does not exist. Creating...");
+    writeFile(SD, CONFIG_FILE, "{}");
+  }
+}
 
 // Function to blink the LED
 void blinkLed()
@@ -44,7 +264,8 @@ void blinkLed()
   }
 }
 
-struct pms5003data {
+struct pms5003data
+{
   uint16_t framelen;
   uint16_t pm10_standard, pm25_standard, pm100_standard;
   uint16_t pm10_env, pm25_env, pm100_env;
@@ -52,59 +273,65 @@ struct pms5003data {
   uint16_t unused;
   uint16_t checksum;
 };
- 
+
 struct pms5003data data;
 
-boolean readPMSdata(Stream *s) {
-  if (! s->available()) {
+boolean readPMSdata(Stream *s)
+{
+  if (!s->available())
+  {
     return false;
   }
-  
+
   // Read a byte at a time until we get to the special '0x42' start-byte
-  if (s->peek() != 0x42) {
+  if (s->peek() != 0x42)
+  {
     s->read();
     return false;
   }
- 
+
   // Now read all 32 bytes
-  if (s->available() < 32) {
+  if (s->available() < 32)
+  {
     return false;
   }
-    
-  uint8_t buffer[32];    
+
+  uint8_t buffer[32];
   uint16_t sum = 0;
   s->readBytes(buffer, 32);
- 
+
   // get checksum ready
-  for (uint8_t i=0; i<30; i++) {
+  for (uint8_t i = 0; i < 30; i++)
+  {
     sum += buffer[i];
   }
- 
+
   /* debugging
   for (uint8_t i=2; i<32; i++) {
     Serial.print("0x"); Serial.print(buffer[i], HEX); Serial.print(", ");
   }
   Serial.println();
   */
-  
+
   // The data comes in endian'd, this solves it so it works on all platforms
   uint16_t buffer_u16[15];
-  for (uint8_t i=0; i<15; i++) {
-    buffer_u16[i] = buffer[2 + i*2 + 1];
-    buffer_u16[i] += (buffer[2 + i*2] << 8);
+  for (uint8_t i = 0; i < 15; i++)
+  {
+    buffer_u16[i] = buffer[2 + i * 2 + 1];
+    buffer_u16[i] += (buffer[2 + i * 2] << 8);
   }
- 
+
   // put it into a nice struct :)
   memcpy((void *)&data, (void *)buffer_u16, 30);
- 
-  if (sum != data.checksum) {
+
+  if (sum != data.checksum)
+  {
     Serial.println("Checksum failure");
     return false;
   }
   // success!
   return true;
 }
-
 
 double round2(double value)
 {
@@ -123,35 +350,45 @@ void pmSensor(void *parameters)
 {
   for (;;)
   {
-    if (readPMSdata(&pmsSerial)) {
-    // reading data was successful!
-    Serial.println();
-    Serial.println("---------------------------------------");
-    Serial.println("Concentration Units (standard)");
-    Serial.print("PM 1.0: "); Serial.print(data.pm10_standard);
-    Serial.print("\t\tPM 2.5: "); Serial.print(data.pm25_standard);
-    Serial.print("\t\tPM 10: "); Serial.println(data.pm100_standard);
-    Serial.println("---------------------------------------");
-    Serial.println("Concentration Units (environmental)");
-    Serial.print("PM 1.0: "); Serial.print(data.pm10_env);
-    Serial.print("\t\tPM 2.5: "); Serial.print(data.pm25_env);
-    Serial.print("\t\tPM 10: "); Serial.println(data.pm100_env);
-    Serial.println("---------------------------------------");
-    Serial.print("Particles > 0.3um / 0.1L air:"); Serial.println(data.particles_03um);
-    Serial.print("Particles > 0.5um / 0.1L air:"); Serial.println(data.particles_05um);
-    Serial.print("Particles > 1.0um / 0.1L air:"); Serial.println(data.particles_10um);
-    Serial.print("Particles > 2.5um / 0.1L air:"); Serial.println(data.particles_25um);
-    Serial.print("Particles > 5.0um / 0.1L air:"); Serial.println(data.particles_50um);
-    Serial.print("Particles > 10.0 um / 0.1L air:"); Serial.println(data.particles_100um);
-    Serial.println("---------------------------------------");
+    if (readPMSdata(&pmsSerial))
+    {
+      // reading data was successful!
+      Serial.println();
+      Serial.println("---------------------------------------");
+      Serial.println("Concentration Units (standard)");
+      Serial.print("PM 1.0: ");
+      Serial.print(data.pm10_standard);
+      Serial.print("\t\tPM 2.5: ");
+      Serial.print(data.pm25_standard);
+      Serial.print("\t\tPM 10: ");
+      Serial.println(data.pm100_standard);
+      Serial.println("---------------------------------------");
+      Serial.println("Concentration Units (environmental)");
+      Serial.print("PM 1.0: ");
+      Serial.print(data.pm10_env);
+      Serial.print("\t\tPM 2.5: ");
+      Serial.print(data.pm25_env);
+      Serial.print("\t\tPM 10: ");
+      Serial.println(data.pm100_env);
+      Serial.println("---------------------------------------");
+      Serial.print("Particles > 0.3um / 0.1L air:");
+      Serial.println(data.particles_03um);
+      Serial.print("Particles > 0.5um / 0.1L air:");
+      Serial.println(data.particles_05um);
+      Serial.print("Particles > 1.0um / 0.1L air:");
+      Serial.println(data.particles_10um);
+      Serial.print("Particles > 2.5um / 0.1L air:");
+      Serial.println(data.particles_25um);
+      Serial.print("Particles > 5.0um / 0.1L air:");
+      Serial.println(data.particles_50um);
+      Serial.print("Particles > 10.0 um / 0.1L air:");
+      Serial.println(data.particles_100um);
+      Serial.println("---------------------------------------");
 
-    telemetryData["p1"] = round2(data.pm10_env);
-    telemetryData["p2"] = round2(bme.readHumidity());
-    telemetryData["p10"] = round2(bme.readHumidity());
-
-
-
-  }
+      telemetryData["p1"] = round2(data.pm10_env);
+      telemetryData["p2"] = round2(data.pm25_env);
+      telemetryData["p10"] = round2(data.pm100_env);
+    }
     vTaskDelay(2500 / portTICK_PERIOD_MS);
   }
 }
@@ -326,15 +563,11 @@ void setup()
 
   pmsSerial.begin(9600);
 
-  if(!SD.begin(5)){
-    Serial.println("Card Mount Failed");
-    return;
-  }
-  uint8_t cardType = SD.cardType();
+  initializeSdCard();
 
-  if(cardType == CARD_NONE){
-    Serial.println("No SD card attached");
-  }
+  // Check and create directories and files if necessary
+  // checkAndCreateDirectories();
+  // checkAndCreateFiles();
 
   // Create FreeRTOS task for all I2C sensor readings
   xTaskCreate(
@@ -355,7 +588,7 @@ void setup()
       1,                  // Task priority
       NULL                // Task handle
   );
-pinMode(SLEEP_PIN, OUTPUT);
+  pinMode(SLEEP_PIN, OUTPUT);
   // Create task for anti-theft detection
   xTaskCreate(
       timeoutChecker,    // Task function
@@ -366,48 +599,77 @@ pinMode(SLEEP_PIN, OUTPUT);
       NULL               // Task handle
   );
 
-// xTaskCreate(
-//       pmSensor,    // Task function
-//       "PM SENSOR", // Task name
-//       3000,              // Stack size (in words)
-//       NULL,              // Task parameters
-//       2,                 // Task priority
-//       NULL               // Task handle
-//   );
+  // xTaskCreate(
+  //       pmSensor,    // Task function
+  //       "PM SENSOR", // Task name
+  //       3000,              // Stack size (in words)
+  //       NULL,              // Task parameters
+  //       2,                 // Task priority
+  //       NULL               // Task handle
+  //   );
+
+  // Create task to continuously check for SD card availability
+  xTaskCreate(
+      checkSdCardAvailabilityTask,  // Task function
+      "SD Card Availability Check", // Task name
+      3000,                         // Stack size (in words)
+      NULL,                         // Task parameters
+      3,                            // Task priority
+      NULL                          // Task handle
+  );
 }
 
 void loop()
 {
   // The main loop is not used, as tasks handle the execution
 
-  if (readPMSdata(&pmsSerial)) {
+  if (readPMSdata(&pmsSerial))
+  {
     // reading data was successful!
     Serial.println();
     Serial.println("---------------------------------------");
     Serial.println("Concentration Units (standard)");
-    Serial.print("PM 1.0: "); Serial.print(data.pm10_standard);
-    Serial.print("\t\tPM 2.5: "); Serial.print(data.pm25_standard);
-    Serial.print("\t\tPM 10: "); Serial.println(data.pm100_standard);
+    Serial.print("PM 1.0: ");
+    Serial.print(data.pm10_standard);
+    Serial.print("\t\tPM 2.5: ");
+    Serial.print(data.pm25_standard);
+    Serial.print("\t\tPM 10: ");
+    Serial.println(data.pm100_standard);
     Serial.println("---------------------------------------");
     Serial.println("Concentration Units (environmental)");
-    Serial.print("PM 1.0: "); Serial.print(data.pm10_env);
-    Serial.print("\t\tPM 2.5: "); Serial.print(data.pm25_env);
-    Serial.print("\t\tPM 10: "); Serial.println(data.pm100_env);
+    Serial.print("PM 1.0: ");
+    Serial.print(data.pm10_env);
+    Serial.print("\t\tPM 2.5: ");
+    Serial.print(data.pm25_env);
+    Serial.print("\t\tPM 10: ");
+    Serial.println(data.pm100_env);
     Serial.println("---------------------------------------");
-    Serial.print("Particles > 0.3um / 0.1L air:"); Serial.println(data.particles_03um);
-    Serial.print("Particles > 0.5um / 0.1L air:"); Serial.println(data.particles_05um);
-    Serial.print("Particles > 1.0um / 0.1L air:"); Serial.println(data.particles_10um);
-    Serial.print("Particles > 2.5um / 0.1L air:"); Serial.println(data.particles_25um);
-    Serial.print("Particles > 5.0um / 0.1L air:"); Serial.println(data.particles_50um);
-    Serial.print("Particles > 10.0 um / 0.1L air:"); Serial.println(data.particles_100um);
+    Serial.print("Particles > 0.3um / 0.1L air:");
+    Serial.println(data.particles_03um);
+    Serial.print("Particles > 0.5um / 0.1L air:");
+    Serial.println(data.particles_05um);
+    Serial.print("Particles > 1.0um / 0.1L air:");
+    Serial.println(data.particles_10um);
+    Serial.print("Particles > 2.5um / 0.1L air:");
+    Serial.println(data.particles_25um);
+    Serial.print("Particles > 5.0um / 0.1L air:");
+    Serial.println(data.particles_50um);
+    Serial.print("Particles > 10.0 um / 0.1L air:");
+    Serial.println(data.particles_100um);
     Serial.println("---------------------------------------");
 
     telemetryData["p1"] = round2(data.pm10_env);
-    telemetryData["p2"] = round2(bme.readHumidity());
-    telemetryData["p10"] = round2(bme.readHumidity());
+    telemetryData["p2"] = round2(data.pm25_env);
+    telemetryData["p10"] = round2(data.pm100_env);
   }
   String jsonString;
+  JsonDocument jsonData;
+  // serializeJson(telemetryData, jsonData);
   serializeJson(telemetryData, jsonString);
   Serial.println(jsonString);
+
+  // Append JSON data to telemetry file
+  appendJsonToFile(SD, TELEMETRY_FILE, jsonString);
+
   delay(5000);
 }
