@@ -11,19 +11,28 @@
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
+#include "WiFi.h"
+#include <AsyncTCP.h>
+#include <DNSServer.h>
+#include "ESPAsyncWebServer.h"
+#include <HTTPClient.h>
+#include "SettingsManager/SettingsManager.h"
+#include "SDCardManager/SDCardManager.h"
 
 // Define paths
-#define SENSOR_DATA_DIR "/Sensor_Data"
-#define LOGS_DIR "/Sensor_Data/logs"
-#define TELEMETRY_DIR "/Sensor_Data/telemetry"
-#define CONFIG_DIR "/Sensor_Data/config"
-#define LOGS_FILE "/Sensor_Data/logs/logs.json"
-#define TELEMETRY_FILE "/Sensor_Data/telemetry/telemetry.json"
-#define CONFIG_FILE "/Sensor_Data/config/config.json"
+const char *settingsFilePath = "/preferences/pref.json";
+const char *directoryPath = "/data";
+const char *filePath = "/data/data.json";
+const char *wifiPath = "/WiFimanager/config.json";
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define INA219_I2C_ADDRESS 0x41
 #define SLEEP_PIN 13
+
+#define EID "2e3"
+#define SD_CS_PIN 5
+#define RESET 25
+#define BUTTON_LED 32
 
 Adafruit_LTR390 ltr = Adafruit_LTR390();
 Adafruit_VEML7700 veml = Adafruit_VEML7700();
@@ -32,8 +41,15 @@ Adafruit_BME280 bme;
 Adafruit_INA219 ina219(INA219_I2C_ADDRESS);
 SoftwareSerial pmsSerial(35, 36);
 
+DNSServer dnsServer;
+AsyncWebServer server(80);
+SDCardManager sdCardManager;
+SettingsManager settingsManager(SD);
+
 // Json Setup
+JsonDocument currentSettings;
 JsonDocument telemetryData;
+JsonDocument config;
 
 // Anti-theft Detection
 const int ledPin = 2;
@@ -42,88 +58,167 @@ float prevX = 0, prevY = 0, prevZ = 0;
 int count1;
 bool isSdCardAvailable = false;
 
+// WiFi Config
+String networkList;
+const int maxRetries = 3;
+const int retryTimeout = 10000;
+bool startDevice = false;
+bool sDmode = false;
+String jsonString;
+
 // Buffer to store data when SD card is not available
 String dataBuffer = "";
 
-// Function to initialize the SD card and check directories/files
-void initializeSdCard()
+// Server Info
+String url = "https://cctelemetry-dev.azurewebsites.net/telemetry";
+
+void scan()
 {
-  if (!SD.begin(5))
-  {
-    Serial.println("SD Card Mount Failed");
-    isSdCardAvailable = false;
-    return;
-  }
-  uint8_t cardType = SD.cardType();
-  if (cardType == CARD_NONE)
-  {
-    Serial.println("No SD card attached");
-    isSdCardAvailable = false;
-    return;
-  }
+  int numberOfNetworks = WiFi.scanNetworks();
 
-  Serial.println("SD Card initialized.");
-  isSdCardAvailable = true;
-
-  // Check and create directories
-  if (!SD.exists(SENSOR_DATA_DIR))
+  Serial.println("Scan complete.");
+  if (numberOfNetworks == 0)
   {
-    SD.mkdir(SENSOR_DATA_DIR);
-    Serial.println("Created Sensor_Data directory");
+    Serial.println("No networks found.");
   }
-
-  if (!SD.exists(LOGS_DIR))
+  else
   {
-    SD.mkdir(LOGS_DIR);
-    Serial.println("Created logs directory");
-  }
+    Serial.print(numberOfNetworks);
+    Serial.println(" networks found:");
 
-  if (!SD.exists(TELEMETRY_DIR))
-  {
-    SD.mkdir(TELEMETRY_DIR);
-    Serial.println("Created telemetry directory");
-  }
+    String json = "{ \"networks\": [";
 
-  if (!SD.exists(CONFIG_DIR))
-  {
-    SD.mkdir(CONFIG_DIR);
-    Serial.println("Created config directory");
-  }
-
-  // Check and create files
-  if (!SD.exists(LOGS_FILE))
-  {
-    File file = SD.open(LOGS_FILE, FILE_WRITE);
-    if (file)
+    for (int i = 0; i < numberOfNetworks; ++i)
     {
-      file.println("[]"); // Initialize as an empty JSON array
-      file.close();
-      Serial.println("Created logs.json file");
+      // Append the SSID to the JSON string
+      json += "\"" + WiFi.SSID(i) + "\"";
+      if (i < numberOfNetworks - 1)
+      {
+        json += ", "; // If it's not the last network, add a comma
+      }
+    }
+
+    json += "]}";
+
+    networkList = json;
+    Serial.println("JSON string of SSIDs:");
+    Serial.println(networkList);
+  }
+  // Wait a bit before scanning again
+  delay(2000);
+}
+
+void connectWiFi(String s, String p)
+{
+  Serial.println("Connecting to WIFI");
+  int retries = 0;
+  while (retries < maxRetries)
+  {
+    Serial.printf("Connecting to WiFi... Retry %d\n", retries + 1);
+    WiFi.begin(s, p);
+
+    delay(300);
+    // Wait for WiFi connection or timeout
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < retryTimeout)
+    {
+      delay(500);
+      timeout += 500;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.println("Connected to WiFi!");
+      startDevice = true;
+      break; // Exit the retry loop if connected
+    }
+    else
+    {
+      Serial.println("Connection failed!");
+      retries++;
     }
   }
-
-  if (!SD.exists(TELEMETRY_FILE))
+  if (retries == maxRetries)
   {
-    File file = SD.open(TELEMETRY_FILE, FILE_WRITE);
-    if (file)
-    {
-      file.println("[]"); // Initialize as an empty JSON array
-      file.close();
-      Serial.println("Created telemetry.json file");
-    }
-  }
-
-  if (!SD.exists(CONFIG_FILE))
-  {
-    File file = SD.open(CONFIG_FILE, FILE_WRITE);
-    if (file)
-    {
-      file.println("{}"); // Initialize as an empty JSON object
-      file.close();
-      Serial.println("Created config.json file");
-    }
+    Serial.println("Max retry attempts reached. Could not connect to WiFi.");
+    Serial.println("Switching to SD Card Mode");
+    // settingsManager.updateWiFi(wifiPath,"", "");
+    // delay(1000);
+    // ESP.restart();
+    sDmode = true;
+    delay(1000);
   }
 }
+
+class CaptiveRequestHandler : public AsyncWebHandler
+{
+public:
+  CaptiveRequestHandler() {}
+  virtual ~CaptiveRequestHandler() {}
+
+  bool canHandle(AsyncWebServerRequest *request)
+  {
+    return true;
+  }
+
+  void handleRequest(AsyncWebServerRequest *request)
+  {
+    if (request->url() == "/config")
+    {
+
+      if (request->method() == HTTP_GET)
+      {
+
+        if (SD.exists("/WiFimanager/index.html"))
+        {
+          request->send(SD, "/WiFimanager/index.html", "text/html");
+        }
+
+        else
+        {
+          request->send(200, "text/plain", "Config file not found on SD card");
+        }
+      }
+    }
+
+    else if (request->url() == "/get-networks")
+    {
+      request->send(200, "application/json", networkList);
+    }
+
+    else if (request->url() == "/param" && request->method() == HTTP_GET)
+    {
+      String ssid = request->arg("ssid");
+      String password = request->arg("pass"); // Change to "pass" to match the HTML form
+      Serial.println(" ");
+      Serial.println("Received SSID: " + ssid);
+      // Serial.println("Received Password: " + password);
+
+      if (SD.exists("/WiFimanager/config.json"))
+      {
+        Serial.println("File Dey Inside");
+        settingsManager.updateWiFi(wifiPath, ssid, password);
+      }
+
+      delay(500);
+
+      connectWiFi(ssid, password);
+
+      request->send(200, "text/plain", "Configuration successful");
+    }
+    else
+    {
+      if (SD.exists("/WiFimanager/wifimanger.html"))
+      {
+        request->send(SD, "/WiFimanager/wifimanger.html", "text/html");
+      }
+      else
+      {
+        request->send(200, "text/plain", "File not found on SD card");
+      }
+    }
+  }
+};
 
 // Function to append JSON data to a file, ensuring each entry is on a new line
 void appendJsonToFile(fs::FS &fs, const char *path, const String &jsonString)
@@ -163,94 +258,24 @@ void appendJsonToFile(fs::FS &fs, const char *path, const String &jsonString)
 }
 
 // Task to check SD card availability continuously
-void checkSdCardAvailabilityTask(void *parameters)
-{
-  while (1)
-  {
-    if (!isSdCardAvailable)
-    {
-      initializeSdCard();
-    }
-    else if (dataBuffer.length() > 0)
-    {
-      // If SD card becomes available, flush buffer to files
-      Serial.println("Flushing buffered data to SD card...");
-      appendJsonToFile(SD, TELEMETRY_FILE, dataBuffer);
-      dataBuffer = ""; // Clear buffer after successful write
-    }
-    vTaskDelay(5000 / portTICK_PERIOD_MS); // Check every 5 seconds
-  }
-}
-
-// Function to write a file (used to create JSON files if they don't exist)
-void writeFile(fs::FS &fs, const char *path, const char *message)
-{
-  if (!isSdCardAvailable)
-    return; // Skip if SD card is not available
-
-  Serial.printf("Writing file: %s\n", path);
-
-  File file = fs.open(path, FILE_WRITE);
-  if (!file)
-  {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-  if (file.print(message))
-  {
-    Serial.println("File written");
-  }
-  else
-  {
-    Serial.println("Write failed");
-  }
-  file.close();
-}
-
-// Function to read a file
-void readFile(fs::FS &fs, const char *path)
-{
-  if (!isSdCardAvailable)
-    return; // Skip if SD card is not available
-
-  Serial.printf("Reading file: %s\n", path);
-
-  File file = fs.open(path);
-  if (!file)
-  {
-    Serial.println("Failed to open file for reading");
-    return;
-  }
-
-  Serial.print("Read from file: ");
-  while (file.available())
-  {
-    Serial.write(file.read());
-  }
-  file.close();
-}
-
-// Function to check and create JSON files if they don't exist
-void checkAndCreateFiles()
-{
-  if (!SD.exists(LOGS_FILE))
-  {
-    Serial.println("Logs JSON file does not exist. Creating...");
-    writeFile(SD, LOGS_FILE, "{}");
-  }
-
-  if (!SD.exists(TELEMETRY_FILE))
-  {
-    Serial.println("Telemetry JSON file does not exist. Creating...");
-    writeFile(SD, TELEMETRY_FILE, "{}");
-  }
-
-  if (!SD.exists(CONFIG_FILE))
-  {
-    Serial.println("Config JSON file does not exist. Creating...");
-    writeFile(SD, CONFIG_FILE, "{}");
-  }
-}
+// void checkSdCardAvailabilityTask(void *parameters)
+// {
+//   while (1)
+//   {
+//     if (!isSdCardAvailable)
+//     {
+//       initializeSdCard();
+//     }
+//     else if (dataBuffer.length() > 0)
+//     {
+//       // If SD card becomes available, flush buffer to files
+//       Serial.println("Flushing buffered data to SD card...");
+//       appendJsonToFile(SD, TELEMETRY_FILE, dataBuffer);
+//       dataBuffer = ""; // Clear buffer after successful write
+//     }
+//     vTaskDelay(5000 / portTICK_PERIOD_MS); // Check every 5 seconds
+//   }
+// }
 
 // Function to blink the LED
 void blinkLed()
@@ -393,6 +418,22 @@ void pmSensor(void *parameters)
   }
 }
 
+void buttonChecker(void *parameters)
+{
+  for (;;)
+  {
+    if (digitalRead(RESET) == HIGH)
+    {
+      settingsManager.updateWiFi(wifiPath, "", "");
+      digitalWrite(BUTTON_LED, HIGH);
+      vTaskDelay(3500 / portTICK_PERIOD_MS);
+
+      ESP.restart();
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
 void timeoutChecker(void *parameters)
 {
   for (;;)
@@ -481,7 +522,7 @@ void readAllI2CSensors(void *pvParameters)
     {
       Serial.print("UV data: ");
       Serial.println(ltr.readUVS());
-      telemetryData["u"] = round2(ltr.readUVS());
+      telemetryData["uv"] = round2(ltr.readUVS());
     }
 
     // Read VEML7700 (light sensor) and display all relevant data under the "lux" section
@@ -505,11 +546,51 @@ void setup()
 {
   pinMode(ledPin, OUTPUT);   // Set LED pin as output
   digitalWrite(ledPin, LOW); // Start with LED off
-
+  pinMode(RESET, INPUT);
   // Initialize Serial for debugging
   Serial.begin(9600);
-  while (!Serial)
-    delay(10); // Wait for Serial to initialize
+  // while (!Serial)
+  //   delay(10); // Wait for Serial to initialize
+
+  if (!SD.begin(SD_CS_PIN))
+  {
+    Serial.println("SD card initialization failed.");
+    return;
+  }
+  else
+  {
+    settingsManager.readSettings(wifiPath, config);
+    String con = config["ssid"];
+    const char *ssid1 = config["ssid"];
+    const char *password1 = config["password"];
+
+    if (con == "" || con == " ")
+    {
+
+      Serial.println("No Access Point Credentials Found");
+
+      WiFi.softAP("CrowdSense-2e4");
+      dnsServer.start(53, "*", WiFi.softAPIP());
+      server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER); // Only when requested from AP
+      server.begin();
+      scan();
+    }
+
+    else
+    {
+      connectWiFi(ssid1, password1);
+      delay(1000);
+    }
+
+    if (!SD.exists(settingsFilePath))
+    {
+      JsonDocument jsonTemplate;
+      deserializeJson(jsonTemplate, settingsManager.getJsonTemplate());
+      settingsManager.saveSettings(settingsFilePath, jsonTemplate);
+    }
+
+    sdCardManager.createDirectory(directoryPath);
+  }
 
   // Initialize MPU6050
   Serial.println("Initializing MPU6050...");
@@ -563,12 +644,6 @@ void setup()
 
   pmsSerial.begin(9600);
 
-  initializeSdCard();
-
-  // Check and create directories and files if necessary
-  // checkAndCreateDirectories();
-  // checkAndCreateFiles();
-
   // Create FreeRTOS task for all I2C sensor readings
   xTaskCreate(
       readAllI2CSensors,  // Task function
@@ -609,19 +684,26 @@ void setup()
   //   );
 
   // Create task to continuously check for SD card availability
-  xTaskCreate(
-      checkSdCardAvailabilityTask,  // Task function
-      "SD Card Availability Check", // Task name
-      3000,                         // Stack size (in words)
-      NULL,                         // Task parameters
-      3,                            // Task priority
-      NULL                          // Task handle
-  );
+  // xTaskCreate(
+  //     checkSdCardAvailabilityTask,  // Task function
+  //     "SD Card Availability Check", // Task name
+  //     3000,                         // Stack size (in words)
+  //     NULL,                         // Task parameters
+  //     3,                            // Task priority
+  //     NULL                          // Task handle
+  // );
 }
 
 void loop()
 {
-  // The main loop is not used, as tasks handle the execution
+  dnsServer.processNextRequest();
+
+  telemetryData["s"] = 0; telemetryData["t"] = 0; telemetryData["p"] = 0;
+  telemetryData["h"] = 0; telemetryData["p1"] = 0; telemetryData["p2"] = 0;
+  telemetryData["p0"] = 0; telemetryData["l"] = 0; telemetryData["b"] = 0;
+  telemetryData["d"] = 0; telemetryData["i"] = "";telemetryData["uv"] = 0;
+  telemetryData["a"] = 0; telemetryData["v"] = "";telemetryData["c"] = 0;
+
 
   if (readPMSdata(&pmsSerial))
   {
@@ -662,14 +744,35 @@ void loop()
     telemetryData["p2"] = round2(data.pm25_env);
     telemetryData["p10"] = round2(data.pm100_env);
   }
-  String jsonString;
-  JsonDocument jsonData;
-  // serializeJson(telemetryData, jsonData);
+
+  telemetryData["i"] = EID;
   serializeJson(telemetryData, jsonString);
   Serial.println(jsonString);
+  sdCardManager.appendFile(filePath, jsonString.c_str());
 
-  // Append JSON data to telemetry file
-  appendJsonToFile(SD, TELEMETRY_FILE, jsonString);
+  // HTTPClient http;
+
+  // http.begin(url);
+  // http.addHeader("Content-Type", "application/json");
+
+  // int httpCode = http.POST(jsonString);
+
+  // if (httpCode == HTTP_CODE_OK)
+  // {
+  //   String response = http.getString();
+  //   Serial.println(response);
+  // }
+  // else
+  // {
+
+  //   Serial.println("Failed 404");
+  // }
+
+  // telemetryData.clear();
+
+  // delay(1000);
+
+  // http.end();
 
   delay(5000);
 }
